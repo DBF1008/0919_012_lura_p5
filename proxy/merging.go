@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/luraproject/lura/v2/config"
@@ -118,7 +119,10 @@ var mergers = map[string]MergerFactory{
 			filters []BackendFilterer,
 			next ...Proxy,
 		) Proxy {
-			return sequentialMerge(reqClone, serviceTimeout, combiner, sequentialReplacements, filters, next...)
+			// sequentialReplacements is built once per endpoint and shared by
+			// every concurrent request: hand each proxy its own copy so any
+			// per-request mutation can never race.
+			return sequentialMerge(reqClone, serviceTimeout, combiner, cloneSequentialReplacements(sequentialReplacements), filters, next...)
 		}
 	},
 	parallelMerger: func(_ *config.EndpointConfig) Merger {
@@ -175,6 +179,27 @@ type sequentialBackendReplacement struct {
 	destination  string
 	source       []string
 	fullResponse bool
+}
+
+// cloneSequentialReplacements returns a deep copy of the received per-backend
+// replacement matrix. The source path slices are the only mutable part, so they
+// get their own backing arrays.
+func cloneSequentialReplacements(in [][]sequentialBackendReplacement) [][]sequentialBackendReplacement {
+	if in == nil {
+		return nil
+	}
+	out := make([][]sequentialBackendReplacement, len(in))
+	for i := range in {
+		if in[i] == nil {
+			continue
+		}
+		out[i] = make([]sequentialBackendReplacement, len(in[i]))
+		for j, r := range in[i] {
+			r.source = append([]string(nil), r.source...)
+			out[i][j] = r
+		}
+	}
+	return out
 }
 
 func forceDeepClone(cfg *config.EndpointConfig) bool {
@@ -408,7 +433,7 @@ func sequentialMerge( // skipcq: GO-R1005
 
 			if (i < filterCount) && (filters[i] != nil) && !filters[i](request) {
 				parts[i] = &Response{IsComplete: true, Data: make(map[string]interface{})}
-				acc.pending--
+				acc.Skip()
 				continue
 			}
 
@@ -442,6 +467,7 @@ type incrementalMergeAccumulator struct {
 	data     *Response
 	combiner ResponseCombiner
 	errs     []error
+	mu       sync.Mutex
 }
 
 func newIncrementalMergeAccumulator(total int, combiner ResponseCombiner) *incrementalMergeAccumulator {
@@ -452,7 +478,17 @@ func newIncrementalMergeAccumulator(total int, combiner ResponseCombiner) *incre
 	}
 }
 
+// Skip marks one backend as intentionally skipped (e.g. filtered out) without
+// collecting a response. It is safe to call concurrently with Merge/Result.
+func (i *incrementalMergeAccumulator) Skip() {
+	i.mu.Lock()
+	i.pending--
+	i.mu.Unlock()
+}
+
 func (i *incrementalMergeAccumulator) Merge(res *Response, err error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	i.pending--
 	if err != nil {
 		i.errs = append(i.errs, err)
@@ -469,10 +505,14 @@ func (i *incrementalMergeAccumulator) Merge(res *Response, err error) {
 		i.data = res
 		return
 	}
+	// the combiner writes into a shared response Data map, so every
+	// invocation must be serialized through the accumulator lock
 	i.data = i.combiner(2, []*Response{i.data, res})
 }
 
 func (i *incrementalMergeAccumulator) Result() (*Response, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	if i.data == nil {
 		return nil, newMergeError(i.errs)
 	}
@@ -590,26 +630,21 @@ func getResponseCombiner(extra config.ExtraConfig) ResponseCombiner {
 
 func combineData(total int, parts []*Response) *Response {
 	isComplete := len(parts) == total
-	var retResponse *Response
+	data := map[string]interface{}{}
+	retResponse := &Response{Data: data}
 	for _, part := range parts {
 		if part == nil || part.Data == nil {
 			isComplete = false
 			continue
 		}
 		isComplete = isComplete && part.IsComplete
-		if retResponse == nil {
-			retResponse = &Response{Data: part.Data, IsComplete: isComplete}
-			continue
-		}
 		for k, v := range part.Data {
-			retResponse.Data[k] = v
+			data[k] = v
 		}
 	}
 
-	if nil == retResponse {
-		// do not allow nil data in the response:
-		return &Response{Data: make(map[string]interface{}), IsComplete: isComplete}
-	}
+	// never mutate the Data maps owned by the collected parts: a backend can
+	// return the same response instance to several concurrent requests
 	retResponse.IsComplete = isComplete
 	return retResponse
 }

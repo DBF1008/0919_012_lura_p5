@@ -16,6 +16,7 @@ func New() *Namespaced {
 // under namespaces and keys
 type Namespaced struct {
 	data *Untyped
+	mu   sync.Mutex
 }
 
 // Get returns the Untyped register stored under the namespace
@@ -30,6 +31,8 @@ func (n *Namespaced) Get(namespace string) (*Untyped, bool) {
 
 // Register stores v at the key name of the Untyped register named namespace
 func (n *Namespaced) Register(namespace, name string, v interface{}) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if register, ok := n.Get(namespace); ok {
 		register.Register(name, v)
 		return
@@ -43,6 +46,8 @@ func (n *Namespaced) Register(namespace, name string, v interface{}) {
 // AddNamespace adds a new, empty Untyped register under the give namespace (if
 // it did not exist)
 func (n *Namespaced) AddNamespace(namespace string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if _, ok := n.Get(namespace); ok {
 		return
 	}
@@ -52,15 +57,14 @@ func (n *Namespaced) AddNamespace(namespace string) {
 // NewUntyped returns an empty Untyped register
 func NewUntyped() *Untyped {
 	return &Untyped{
-		data:  map[string]interface{}{},
-		mutex: &sync.RWMutex{},
+		data: map[string]interface{}{},
 	}
 }
 
 // Untyped is a simple register, safe for concurrent access
 type Untyped struct {
 	data  map[string]interface{}
-	mutex *sync.RWMutex
+	mutex sync.RWMutex
 }
 
 // Register stores v under the key name
